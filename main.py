@@ -1,90 +1,122 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import openai
-from dotenv import load_dotenv
 import os
-import platform
-import subprocess
+import tkinter as tk
+from tkinter import filedialog
+import whisper
+from pyannote.audio import Pipeline
+import ffmpeg
+import shutil
+import threading
 
-# Загрузка API-ключа OpenAI из .env файла
+from dotenv import load_dotenv
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# Получение пути к рабочему столу в зависимости от ОС
-def get_desktop_path():
-    if platform.system() == "Windows":
-        return os.path.join(os.environ['USERPROFILE'], 'Desktop')
-    else:
-        return os.path.join(os.path.expanduser('~'), 'Desktop')
+# Инициализация модели диаризации
+diarization_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=HF_TOKEN)
 
-# Функция для конвертации аудиофайла с Whisper
-def transcribe_audio(file_path):
+# Функция для конвертации MP3 в WAV
+def convert_to_wav(input_file):
+    output_file = "temp.wav"
     try:
-        with open(file_path, "rb") as audio_file:
-            # Отображение сообщения об отправке в нейросеть
-            result_label.config(text="Отправка в нейромир...")
-            root.update_idletasks()  # Обновление интерфейса для отображения сообщения
-            
-            # Запрос к OpenAI API
-            transcription = openai.Audio.transcribe(
-                model="whisper-1",
-                file=audio_file
-            )
-        return transcription['text']
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        (
+            ffmpeg
+            .input(input_file)
+            .output(output_file)
+            .run(overwrite_output=True)
+        )
+        return output_file
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Ошибка при конвертации: {e}")
+        status_label.config(text=f"Ошибка при конвертации: {e}")
         return None
 
-# Функция для открытия файла после конвертации
-def open_file(filepath):
-    if platform.system() == "Windows":
-        os.startfile(filepath)
-    elif platform.system() == "Darwin":  # macOS
-        subprocess.call(('open', filepath))
-    else:  # Linux
-        subprocess.call(('xdg-open', filepath))
-
-# Функция для выбора файла и его конвертации
-def choose_file():
-    file_path = filedialog.askopenfilename(
-        filetypes=[("Audio Files", "*.mp3 *.wav *.m4a")]
-    )
+# Функция для обработки аудио
+def process_audio(file_path, model_size):
+    status_label.config(text="Конвертация MP3 в WAV...")
+    root.update_idletasks()
     
+    wav_file = convert_to_wav(file_path)
+    if wav_file is None:
+        return
+    
+    try:
+        # Whisper для транскрипции
+        status_label.config(text="Запуск Whisper для транскрипции...")
+        root.update_idletasks()
+        model = whisper.load_model(model_size)
+        result = model.transcribe(wav_file, verbose=True)
+        
+        # Путь к рабочему столу
+        desktop_path = os.path.join(os.path.join(os.environ['USERPROFILE']), 'Desktop')
+
+        # Сохраняем результат Whisper на рабочий стол
+        whisper_output_file = os.path.join(desktop_path, "whisper_transcription.txt")
+        with open(whisper_output_file, "w", encoding="utf-8") as whisper_file:
+            whisper_file.write(result["text"])
+        
+        # Выполняем диаризацию
+        status_label.config(text="Диаризация...")
+        root.update_idletasks()
+        diarization = diarization_model(wav_file)
+        
+        # Сохраняем результат диаризации на рабочий стол
+        diarization_output_file = os.path.join(desktop_path, "diarized_transcription.txt")
+        with open(diarization_output_file, "w", encoding="utf-8") as diarization_file:
+            segments = result["segments"]
+            for segment in segments:
+                start_time = segment["start"]
+                end_time = segment["end"]
+                text = segment["text"]
+                
+                # Ищем спикера для этого сегмента
+                speaker = None
+                for speech_segment, _, spkr in diarization.itertracks(yield_label=True):
+                    if speech_segment.start <= start_time <= speech_segment.end:
+                        speaker = spkr
+                        break
+                
+                if speaker is None:
+                    speaker = "Unknown"
+                
+                diarization_file.write(f"{speaker}: {start_time:.1f}-{end_time:.1f}: {text}\n")
+        
+        status_label.config(text="Обработка завершена. Файлы сохранены на рабочий стол.")
+    except Exception as e:
+        status_label.config(text=f"Ошибка при выполнении диаризации: {e}")
+    finally:
+        if os.path.exists(wav_file):
+            os.remove(wav_file)
+
+# Функция для выполнения обработки в отдельном потоке
+def process_audio_thread(file_path, model_size):
+    threading.Thread(target=process_audio, args=(file_path, model_size)).start()
+
+# Выбор файла и запуск обработки
+def select_file():
+    file_path = filedialog.askopenfilename()
     if file_path:
-        result_label.config(text="Идёт конвертация...")
-        transcription_text = transcribe_audio(file_path)
-        if transcription_text is None:
-            result_label.config(text="Ошибка конвертации.")
-            return
-        
-        # Сохранение результата конвертации на рабочий стол
-        desktop_path = get_desktop_path()
-        output_file_path = os.path.join(desktop_path, "CONVERTED.txt")
-        with open(output_file_path, "w") as output_file:
-            output_file.write("конвертация:\n")
-            output_file.write(transcription_text)
-        
-        result_label.config(text="Обработка завершена! Результат сохранён на рабочем столе.")
-        
-        # Открытие файла после сохранения
-        open_file(output_file_path)
+        model_size = model_var.get()
+        process_audio_thread(file_path, model_size)
 
-# Настройка окна
+# Настройка интерфейса Tkinter
 root = tk.Tk()
-root.title("Конвертер аудио в текст")
-root.geometry("500x300")
+root.title("Аудио процессор")
 
-# Надпись заголовка
-title_label = tk.Label(root, text="Выберите аудиофайл для конвертации", font=("Arial", 14))
-title_label.pack(pady=10)
+# Кнопка для выбора файла
+select_button = tk.Button(root, text="Выбрать аудиофайл", command=select_file)
+select_button.pack(pady=10)
 
-# Кнопка для выбора файла и начала конвертации
-transcribe_button = tk.Button(root, text="Аудио->Текст", font=("Arial", 12), command=choose_file)
-transcribe_button.pack(pady=10)
+# Статус выполнения
+status_label = tk.Label(root, text="Ожидание выбора файла...")
+status_label.pack(pady=10)
 
-# Метка для вывода результата
-result_label = tk.Label(root, text="Development by MaxXx", font=("Arial", 12))
-result_label.pack(pady=20)
+# Выбор модели Whisper
+model_var = tk.StringVar(value="small")
+tk.Label(root, text="Качество распознования:").pack()
+tk.Radiobutton(root, text="низкое", variable=model_var, value="small").pack()
+tk.Radiobutton(root, text="среднее", variable=model_var, value="medium").pack()
+tk.Radiobutton(root, text="Высокое", variable=model_var, value="large-v3").pack()
 
-# Запуск основного цикла приложения
+# Запуск интерфейса
 root.mainloop()
